@@ -26,6 +26,7 @@ import { db } from "../config/db"
 export default function SalesPage() {
   const { isAdmin } = useAuth()
   const { isOnline } = useSync()
+
   const [sales, setSales] = useState([])
   const [loading, setLoading] = useState(true)
   const [detailModalOpened, setDetailModalOpened] = useState(false)
@@ -37,25 +38,60 @@ export default function SalesPage() {
     loadSales()
   }, [isOnline, statusFilter])
 
+  const normalizeSalesForIndexedDB = (data) => {
+    return data.map((sale) => {
+      const cleanSale = { ...sale }
+
+      /*
+        IMPORTANTE:
+        Dexie usa "++localId" como clave primaria autoincremental.
+        Si el backend envía localId como null, undefined, objeto o string vacío,
+        IndexedDB falla con:
+        "key path yielded a value that is not a valid key".
+      */
+      delete cleanSale.localId
+
+      return {
+        ...cleanSale,
+        synced: true,
+      }
+    })
+  }
+
   const loadSales = async () => {
     try {
       setLoading(true)
+
       const params = {}
 
-      if (dateRange[0]) params.startDate = dateRange[0].toISOString()
-      if (dateRange[1]) params.endDate = dateRange[1].toISOString()
-      if (statusFilter) params.status = statusFilter
+      if (dateRange[0]) {
+        params.startDate = dateRange[0].toISOString()
+      }
+
+      if (dateRange[1]) {
+        params.endDate = dateRange[1].toISOString()
+      }
+
+      if (statusFilter) {
+        params.status = statusFilter
+      }
 
       if (isOnline) {
         try {
           const data = await api.getSales(params)
-          setSales(data)
+
+          const normalizedSales = normalizeSalesForIndexedDB(data)
+
+          setSales(normalizedSales)
+
           await db.sales.clear()
-          await db.sales.bulkPut(data)
+          await db.sales.bulkPut(normalizedSales)
         } catch (error) {
           console.warn("[SalesPage] Error fetching sales, using local cache", error)
-          const data = await db.sales.toArray()
-          setSales(data)
+
+          const localData = await db.sales.toArray()
+          setSales(localData)
+
           notifications.show({
             title: "Modo offline",
             message: "No se pudo conectar al servidor, mostrando ventas locales",
@@ -63,10 +99,12 @@ export default function SalesPage() {
           })
         }
       } else {
-        const data = await db.sales.toArray()
-        setSales(data)
+        const localData = await db.sales.toArray()
+        setSales(localData)
       }
     } catch (error) {
+      console.error("[SalesPage] Error general al cargar ventas:", error)
+
       notifications.show({
         title: "Error",
         message: "Error al cargar ventas",
@@ -80,19 +118,47 @@ export default function SalesPage() {
   const openDetailModal = async (sale) => {
     try {
       if (!isOnline) {
-        const localSale = await db.sales.where("id").equals(sale.id).first()
+        let localSale = null
+
+        if (sale.id) {
+          localSale = await db.sales.where("id").equals(sale.id).first()
+        }
+
+        if (!localSale && sale.localId) {
+          localSale = await db.sales.get(sale.localId)
+        }
+
         if (localSale) {
-          const items = await db.saleItems.where("saleLocalId").equals(localSale.localId).toArray()
-          setSelectedSale({ ...localSale, items })
+          const items = await db.saleItems
+            .where("saleLocalId")
+            .equals(localSale.localId)
+            .toArray()
+
+          setSelectedSale({
+            ...localSale,
+            items,
+          })
+
           setDetailModalOpened(true)
           return
         }
+      }
+
+      if (!sale.id) {
+        notifications.show({
+          title: "Venta local",
+          message: "Esta venta todavía no está sincronizada con el servidor",
+          color: "orange",
+        })
+        return
       }
 
       const data = await api.getSale(sale.id)
       setSelectedSale(data)
       setDetailModalOpened(true)
     } catch (error) {
+      console.error("[SalesPage] Error al cargar detalle:", error)
+
       notifications.show({
         title: "Error",
         message: "Error al cargar detalles de la venta",
@@ -102,17 +168,30 @@ export default function SalesPage() {
   }
 
   const handleCancelSale = async (saleId) => {
+    if (!saleId) {
+      notifications.show({
+        title: "Error",
+        message: "No se puede cancelar una venta local no sincronizada",
+        color: "red",
+      })
+      return
+    }
+
     if (!confirm("¿Estás seguro de cancelar esta venta?")) return
 
     try {
       await api.cancelSale(saleId)
+
       notifications.show({
         title: "Éxito",
         message: "Venta cancelada correctamente",
         color: "green",
       })
+
       loadSales()
     } catch (error) {
+      console.error("[SalesPage] Error al cancelar venta:", error)
+
       notifications.show({
         title: "Error",
         message: "Error al cancelar venta",
@@ -141,7 +220,25 @@ export default function SalesPage() {
       TRANSFER: "Transferencia",
       OTHER: "Otro",
     }
-    return labels[method] || method
+
+    return labels[method] || method || "No definido"
+  }
+
+  const formatMoney = (value) => {
+    const number = Number(value || 0)
+    return `$${number.toFixed(2)}`
+  }
+
+  const formatDate = (value) => {
+    if (!value) return "Sin fecha"
+
+    const date = new Date(value)
+
+    if (Number.isNaN(date.getTime())) {
+      return "Fecha inválida"
+    }
+
+    return date.toLocaleString()
   }
 
   return (
@@ -151,14 +248,22 @@ export default function SalesPage() {
           <Text size="xl" fw={700}>
             Historial de Ventas
           </Text>
-          <Button leftSection={<IconRefresh size={16} />} onClick={loadSales} disabled={!isOnline}>
+
+          <Button
+            leftSection={<IconRefresh size={16} />}
+            onClick={loadSales}
+            disabled={!isOnline}
+          >
             Actualizar
           </Button>
         </Group>
 
         {!isOnline && (
           <Card withBorder bg="orange.0" padding="md">
-            <Text size="sm">Necesitas conexión para ver el historial de ventas</Text>
+            <Text size="sm">
+              Necesitas conexión para ver el historial actualizado de ventas.
+              Se mostrarán las ventas guardadas localmente.
+            </Text>
           </Card>
         )}
 
@@ -175,18 +280,18 @@ export default function SalesPage() {
                   clearable
                 />
               </Grid.Col>
+
               <Grid.Col span={{ base: 12, sm: 6 }}>
                 <Select
                   label="Estado"
                   placeholder="Todos"
                   data={[
-                    { value: "", label: "Todos" },
                     { value: "COMPLETED", label: "Completada" },
                     { value: "PENDING", label: "Pendiente" },
                     { value: "CANCELLED", label: "Cancelada" },
                   ]}
-                  value={statusFilter}
-                  onChange={setStatusFilter}
+                  value={statusFilter || null}
+                  onChange={(value) => setStatusFilter(value || "")}
                   clearable
                 />
               </Grid.Col>
@@ -208,35 +313,54 @@ export default function SalesPage() {
                     <Table.Th>Acciones</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
+
                 <Table.Tbody>
                   {sales.map((sale) => (
-                    <Table.Tr key={sale.id}>
+                    <Table.Tr key={sale.id || sale.localId}>
                       <Table.Td>
-                        <Text fw={500}>{sale.saleNumber}</Text>
+                        <Text fw={500}>
+                          {sale.saleNumber || `Local-${sale.localId}`}
+                        </Text>
                       </Table.Td>
-                      <Table.Td>{new Date(sale.createdAt).toLocaleString()}</Table.Td>
+
+                      <Table.Td>{formatDate(sale.createdAt)}</Table.Td>
+
                       <Table.Td>{sale.customer?.name || "Sin cliente"}</Table.Td>
-                      <Table.Td>{sale.user?.name}</Table.Td>
+
+                      <Table.Td>{sale.user?.name || "Sin usuario"}</Table.Td>
+
                       <Table.Td>
-                        <Text fw={700}>${sale.total.toFixed(2)}</Text>
+                        <Text fw={700}>{formatMoney(sale.total)}</Text>
                       </Table.Td>
+
                       <Table.Td>
-                        <Badge variant="light">{getPaymentMethodLabel(sale.paymentMethod)}</Badge>
+                        <Badge variant="light">
+                          {getPaymentMethodLabel(sale.paymentMethod)}
+                        </Badge>
                       </Table.Td>
+
                       <Table.Td>
-                        <Badge color={getStatusColor(sale.status)}>{sale.status}</Badge>
+                        <Badge color={getStatusColor(sale.status)}>
+                          {sale.status || "SIN ESTADO"}
+                        </Badge>
                       </Table.Td>
+
                       <Table.Td>
                         <Group gap="xs">
-                          <ActionIcon variant="light" color="blue" onClick={() => openDetailModal(sale)}>
+                          <ActionIcon
+                            variant="light"
+                            color="blue"
+                            onClick={() => openDetailModal(sale)}
+                          >
                             <IconEye size={16} />
                           </ActionIcon>
+
                           {isAdmin() && sale.status === "COMPLETED" && (
                             <ActionIcon
                               variant="light"
                               color="red"
                               onClick={() => handleCancelSale(sale.id)}
-                              disabled={!isOnline}
+                              disabled={!isOnline || !sale.id}
                             >
                               <IconX size={16} />
                             </ActionIcon>
@@ -273,32 +397,41 @@ export default function SalesPage() {
                   <Text size="sm" c="dimmed">
                     Número de Venta
                   </Text>
-                  <Text fw={700}>{selectedSale.saleNumber}</Text>
+                  <Text fw={700}>
+                    {selectedSale.saleNumber || `Local-${selectedSale.localId}`}
+                  </Text>
                 </Grid.Col>
+
                 <Grid.Col span={6}>
                   <Text size="sm" c="dimmed">
                     Estado
                   </Text>
-                  <Badge color={getStatusColor(selectedSale.status)}>{selectedSale.status}</Badge>
+                  <Badge color={getStatusColor(selectedSale.status)}>
+                    {selectedSale.status || "SIN ESTADO"}
+                  </Badge>
                 </Grid.Col>
+
                 <Grid.Col span={6}>
                   <Text size="sm" c="dimmed">
                     Fecha
                   </Text>
-                  <Text>{new Date(selectedSale.createdAt).toLocaleString()}</Text>
+                  <Text>{formatDate(selectedSale.createdAt)}</Text>
                 </Grid.Col>
+
                 <Grid.Col span={6}>
                   <Text size="sm" c="dimmed">
                     Método de Pago
                   </Text>
                   <Text>{getPaymentMethodLabel(selectedSale.paymentMethod)}</Text>
                 </Grid.Col>
+
                 <Grid.Col span={6}>
                   <Text size="sm" c="dimmed">
                     Cajero
                   </Text>
-                  <Text>{selectedSale.user?.name}</Text>
+                  <Text>{selectedSale.user?.name || "Sin usuario"}</Text>
                 </Grid.Col>
+
                 <Grid.Col span={6}>
                   <Text size="sm" c="dimmed">
                     Cliente
@@ -309,6 +442,7 @@ export default function SalesPage() {
             </Card>
 
             <Text fw={700}>Productos</Text>
+
             <Table>
               <Table.Thead>
                 <Table.Tr>
@@ -318,13 +452,14 @@ export default function SalesPage() {
                   <Table.Th>Subtotal</Table.Th>
                 </Table.Tr>
               </Table.Thead>
+
               <Table.Tbody>
                 {selectedSale.items?.map((item) => (
-                  <Table.Tr key={item.id}>
-                    <Table.Td>{item.product?.name}</Table.Td>
-                    <Table.Td>{item.quantity}</Table.Td>
-                    <Table.Td>${item.price.toFixed(2)}</Table.Td>
-                    <Table.Td>${item.subtotal.toFixed(2)}</Table.Td>
+                  <Table.Tr key={item.id || item.localId || item.productId}>
+                    <Table.Td>{item.product?.name || "Producto"}</Table.Td>
+                    <Table.Td>{item.quantity || 0}</Table.Td>
+                    <Table.Td>{formatMoney(item.price)}</Table.Td>
+                    <Table.Td>{formatMoney(item.subtotal)}</Table.Td>
                   </Table.Tr>
                 ))}
               </Table.Tbody>
@@ -334,28 +469,31 @@ export default function SalesPage() {
               <Stack gap="xs">
                 <Group justify="space-between">
                   <Text>Subtotal:</Text>
-                  <Text fw={500}>${selectedSale.subtotal.toFixed(2)}</Text>
+                  <Text fw={500}>{formatMoney(selectedSale.subtotal)}</Text>
                 </Group>
-                {selectedSale.discount > 0 && (
+
+                {Number(selectedSale.discount || 0) > 0 && (
                   <Group justify="space-between">
                     <Text>Descuento:</Text>
                     <Text fw={500} c="red">
-                      -${selectedSale.discount.toFixed(2)}
+                      -{formatMoney(selectedSale.discount)}
                     </Text>
                   </Group>
                 )}
-                {selectedSale.tax > 0 && (
+
+                {Number(selectedSale.tax || 0) > 0 && (
                   <Group justify="space-between">
                     <Text>Impuesto:</Text>
-                    <Text fw={500}>${selectedSale.tax.toFixed(2)}</Text>
+                    <Text fw={500}>{formatMoney(selectedSale.tax)}</Text>
                   </Group>
                 )}
+
                 <Group justify="space-between">
                   <Text fw={700} size="lg">
                     TOTAL:
                   </Text>
                   <Text fw={700} size="lg" c="blue">
-                    ${selectedSale.total.toFixed(2)}
+                    {formatMoney(selectedSale.total)}
                   </Text>
                 </Group>
               </Stack>
