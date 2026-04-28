@@ -39,24 +39,40 @@ export default function SalesPage() {
   }, [isOnline, statusFilter])
 
   const normalizeSalesForIndexedDB = (data) => {
-    return data.map((sale) => {
-      const cleanSale = { ...sale }
+  const salesArray = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.sales)
+      ? data.sales
+      : Array.isArray(data?.data)
+        ? data.data
+        : []
 
-      /*
-        IMPORTANTE:
-        Dexie usa "++localId" como clave primaria autoincremental.
-        Si el backend envía localId como null, undefined, objeto o string vacío,
-        IndexedDB falla con:
-        "key path yielded a value that is not a valid key".
-      */
-      delete cleanSale.localId
+  return salesArray.map((sale) => {
+    const cleanSale = { ...sale }
 
-      return {
-        ...cleanSale,
-        synced: true,
-      }
-    })
-  }
+    /*
+      Dexie usa ++localId como clave primaria.
+      No debe venir desde el backend.
+    */
+    delete cleanSale.localId
+
+    /*
+      Normalizar campos indexados para evitar valores problemáticos.
+    */
+    return {
+      ...cleanSale,
+      id: cleanSale.id ?? `server-${Date.now()}-${Math.random()}`,
+      userId: cleanSale.userId ?? cleanSale.user?.id ?? null,
+      status: cleanSale.status || "COMPLETED",
+      createdAt: cleanSale.createdAt || new Date().toISOString(),
+      synced: true,
+      total: Number(cleanSale.total || 0),
+      subtotal: Number(cleanSale.subtotal || 0),
+      discount: Number(cleanSale.discount || 0),
+      tax: Number(cleanSale.tax || 0),
+    }
+  })
+}
 
   const loadSales = async () => {
     try {
@@ -80,12 +96,23 @@ export default function SalesPage() {
         try {
           const data = await api.getSales(params)
 
-          const normalizedSales = normalizeSalesForIndexedDB(data)
+const normalizedSales = normalizeSalesForIndexedDB(data)
+
+console.log("[SalesPage] Ventas recibidas del API:", data)
+console.log("[SalesPage] Ventas normalizadas para IndexedDB:", normalizedSales)
 
           setSales(normalizedSales)
 
-          await db.sales.clear()
-          await db.sales.bulkPut(normalizedSales)
+await db.sales.clear()
+
+for (const sale of normalizedSales) {
+  try {
+    await db.sales.add(sale)
+  } catch (err) {
+    console.error("[SalesPage] Venta que no se pudo guardar en IndexedDB:", sale)
+    console.error("[SalesPage] Error guardando venta:", err)
+  }
+}
         } catch (error) {
           console.warn("[SalesPage] Error fetching sales, using local cache", error)
 
