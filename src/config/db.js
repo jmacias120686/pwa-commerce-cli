@@ -3,7 +3,7 @@ import Dexie from "dexie"
 // IndexedDB para almacenamiento local offline
 export const db = new Dexie("PWACommerceDB")
 
-db.version(1).stores({
+db.version(2).stores({
   products: "id, code, name, categoryId, active",
   categories: "id, name",
   customers: "id, name, email, phone",
